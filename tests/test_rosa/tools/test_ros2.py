@@ -15,11 +15,12 @@
 import os
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, call
 
 try:
     from src.rosa.tools.ros2 import (
         execute_ros_command,
+        _validate_ros_arg,
         ros2_node_list,
         ros2_topic_list,
         ros2_topic_echo,
@@ -28,6 +29,7 @@ try:
         ros2_param_list,
         ros2_param_get,
         ros2_param_set,
+        ros2_service_call,
     )
 except ModuleNotFoundError:
     pass
@@ -39,12 +41,32 @@ except ModuleNotFoundError:
 )
 class TestROS2Tools(unittest.TestCase):
 
+    # ------------------------------------------------------------------ #
+    #  execute_ros_command: basic functionality
+    # ------------------------------------------------------------------ #
+
     @patch("src.rosa.tools.ros2.subprocess.check_output")
-    def test_execute_valid_ros2_command(self, mock_check_output):
+    def test_execute_valid_ros2_command_string(self, mock_check_output):
+        """Backward-compat: accept a plain string and split it."""
         mock_check_output.return_value = b"Node /example_node\n"
         success, output = execute_ros_command("ros2 node list")
         self.assertTrue(success)
         self.assertEqual(output, "Node /example_node\n")
+        # The critical assertion: shell=False must be used
+        mock_check_output.assert_called_once_with(
+            ["ros2", "node", "list"], shell=False
+        )
+
+    @patch("src.rosa.tools.ros2.subprocess.check_output")
+    def test_execute_valid_ros2_command_list(self, mock_check_output):
+        """Preferred path: accept a pre-split list."""
+        mock_check_output.return_value = b"/topic1\n/topic2\n"
+        success, output = execute_ros_command(["ros2", "topic", "list"])
+        self.assertTrue(success)
+        self.assertEqual(output, "/topic1\n/topic2\n")
+        mock_check_output.assert_called_once_with(
+            ["ros2", "topic", "list"], shell=False
+        )
 
     @patch("src.rosa.tools.ros2.subprocess.check_output")
     def test_execute_invalid_ros2_command(self, mock_check_output):
@@ -68,6 +90,106 @@ class TestROS2Tools(unittest.TestCase):
     def test_execute_command_with_insufficient_arguments(self):
         with self.assertRaises(ValueError):
             execute_ros_command("ros2")
+
+    # ------------------------------------------------------------------ #
+    #  shell=False enforcement (the core security assertion)
+    # ------------------------------------------------------------------ #
+
+    @patch("src.rosa.tools.ros2.subprocess.check_output")
+    def test_shell_false_is_always_used(self, mock_check_output):
+        """Ensure every call goes through shell=False."""
+        mock_check_output.return_value = b"ok\n"
+        execute_ros_command("ros2 node list")
+        for c in mock_check_output.call_args_list:
+            self.assertEqual(c.kwargs.get("shell", c[1].get("shell")), False)
+
+    # ------------------------------------------------------------------ #
+    #  Input sanitisation: _validate_ros_arg
+    # ------------------------------------------------------------------ #
+
+    def test_validate_ros_arg_accepts_normal_names(self):
+        """Normal ROS names should pass validation."""
+        for name in ["/turtle1/cmd_vel", "/node_1", "std_srvs/srv/Empty",
+                     "my_param", "0.5", "/ns/sub/topic"]:
+            _validate_ros_arg(name)  # should not raise
+
+    def test_validate_ros_arg_rejects_semicolon(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("/topic; rm -rf /")
+
+    def test_validate_ros_arg_rejects_pipe(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("/topic | cat /etc/passwd")
+
+    def test_validate_ros_arg_rejects_backtick(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("`whoami`")
+
+    def test_validate_ros_arg_rejects_dollar(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("$(cat /etc/shadow)")
+
+    def test_validate_ros_arg_rejects_ampersand(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("/topic & malicious_cmd")
+
+    def test_validate_ros_arg_rejects_newline(self):
+        with self.assertRaises(ValueError):
+            _validate_ros_arg("/topic\nmalicious_cmd")
+
+    # ------------------------------------------------------------------ #
+    #  Shell injection attack scenarios
+    # ------------------------------------------------------------------ #
+
+    @patch("src.rosa.tools.ros2.execute_ros_command")
+    def test_topic_echo_rejects_injection_in_topic(self, mock_execute):
+        """LLM-generated topic name with injection payload must be rejected."""
+        result = ros2_topic_echo.invoke(
+            {"topic": "/topic; rm -rf /", "count": 1}
+        )
+        # The tool should never reach execute_ros_command
+        mock_execute.assert_not_called()
+
+    @patch("src.rosa.tools.ros2.execute_ros_command")
+    def test_node_info_rejects_injection(self, mock_execute):
+        """Node name with injection payload must be rejected."""
+        result = ros2_node_info.invoke({"nodes": ["/node`whoami`"]})
+        mock_execute.assert_not_called()
+        self.assertIn("error", result.get("/node`whoami`", {}))
+
+    @patch("src.rosa.tools.ros2.execute_ros_command")
+    def test_param_set_rejects_injection_in_value(self, mock_execute):
+        """Parameter value with injection payload must be rejected."""
+        result = ros2_param_set.invoke({
+            "node_name": "/example_node",
+            "param_name": "safe_param",
+            "param_value": "value; cat /etc/passwd",
+        })
+        mock_execute.assert_not_called()
+
+    @patch("src.rosa.tools.ros2.execute_ros_command")
+    def test_service_call_rejects_injection_in_service_name(self, mock_execute):
+        """Service name with injection payload must be rejected."""
+        result = ros2_service_call.invoke({
+            "service_name": "/srv$(whoami)",
+            "srv_type": "std_srvs/srv/Empty",
+            "request": "{}",
+        })
+        mock_execute.assert_not_called()
+
+    @patch("src.rosa.tools.ros2.execute_ros_command")
+    def test_service_call_rejects_injection_in_type(self, mock_execute):
+        """Service type with injection payload must be rejected."""
+        result = ros2_service_call.invoke({
+            "service_name": "/safe_service",
+            "srv_type": "std_srvs; rm -rf /",
+            "request": "{}",
+        })
+        mock_execute.assert_not_called()
+
+    # ------------------------------------------------------------------ #
+    #  Existing functional tests (updated for list-based command passing)
+    # ------------------------------------------------------------------ #
 
     @patch("src.rosa.tools.ros2.execute_ros_command")
     def test_ros2_node_list_returns_nodes(self, mock_execute):

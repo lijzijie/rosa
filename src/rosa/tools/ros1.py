@@ -743,8 +743,19 @@ def roslaunch(package: str, launch_file: str) -> str:
     :param package: The name of the ROS package containing the launch file.
     :param launch_file: The name of the launch file to launch.
     """
+    import subprocess as _sp
+    import re as _re
+
+    # Reject shell metacharacters to prevent command injection
+    _meta = _re.compile(r"[;&|`$(){}!\n\r\\]")
+    if _meta.search(package) or _meta.search(launch_file):
+        return (
+            f"Invalid package or launch file name: names must not contain "
+            f"shell metacharacters."
+        )
+
     try:
-        os.system(f"roslaunch {package} {launch_file}")
+        _sp.run(["roslaunch", package, launch_file], check=True)
         return f"Launched ROS launch file '{launch_file}' in package '{package}'."
     except Exception as e:
         return f"Failed to launch ROS launch file '{launch_file}' in package '{package}': {e}"

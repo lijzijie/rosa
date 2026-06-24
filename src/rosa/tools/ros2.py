@@ -14,6 +14,7 @@
 
 import os
 import re
+import shlex
 import subprocess
 import time
 from typing import List, Optional, Tuple
@@ -22,34 +23,62 @@ from langchain.agents import tool
 from rclpy.logging import get_logging_directory
 
 
-def execute_ros_command(command: str) -> Tuple[bool, str]:
+# Characters that should never appear in ROS entity names or parameters.
+# This guards against shell metacharacter injection from LLM-generated inputs.
+_SHELL_META_CHARS = re.compile(r"[;&|`$(){}!\n\r\\]")
+
+
+def _validate_ros_arg(value: str, label: str = "argument") -> None:
+    """Validate that a ROS argument does not contain shell metacharacters.
+
+    :param value: The argument value to validate.
+    :param label: Human-readable label for error messages.
+    :raises ValueError: If the value contains dangerous characters.
+    """
+    if _SHELL_META_CHARS.search(value):
+        raise ValueError(
+            f"Invalid {label}: '{value}' contains disallowed shell metacharacters."
+        )
+
+
+def execute_ros_command(command) -> Tuple[bool, str]:
     """
     Execute a ROS2 command.
 
-    :param command: The ROS2 command to execute.
-    :return: A tuple containing a boolean indicating success and the output of the command.
-    """
+    Accepts either a pre-split list of arguments (preferred) or a single
+    command string for backward compatibility.  In both cases the command
+    is executed **without** a shell (``shell=False``) to prevent command
+    injection.
 
-    # Validate the command is a proper ROS2 command
-    cmd = command.split(" ")
+    :param command: The ROS2 command – either a ``list[str]`` of arguments
+        or a single ``str`` that will be split with :func:`shlex.split`.
+    :return: A tuple containing a boolean indicating success and the output
+        of the command.
+    """
+    # Normalise to a list of arguments
+    if isinstance(command, str):
+        cmd = shlex.split(command)
+    else:
+        cmd = list(command)
+
     valid_ros2_commands = ["node", "topic", "service", "param", "doctor"]
 
     if len(cmd) < 2:
-        raise ValueError(f"'{command}' is not a valid ROS2 command.")
+        raise ValueError(f"'{' '.join(cmd)}' is not a valid ROS2 command.")
     if cmd[0] != "ros2":
-        raise ValueError(f"'{command}' is not a valid ROS2 command.")
+        raise ValueError(f"'{' '.join(cmd)}' is not a valid ROS2 command.")
     if cmd[1] not in valid_ros2_commands:
         raise ValueError(f"'ros2 {cmd[1]}' is not a valid ros2 subcommand.")
 
     try:
-        output = subprocess.check_output(command, shell=True).decode()
+        output = subprocess.check_output(cmd, shell=False).decode()
         return True, output
     except Exception as e:
         return False, str(e)
 
 
 def get_entities(
-    cmd: str,
+    cmd: list,
     delimiter: str = "\n",
     pattern: str = None,
     blacklist: Optional[List[str]] = None,
@@ -57,7 +86,7 @@ def get_entities(
     """
     Get a list of ROS2 entities (nodes, topics, services, etc.).
 
-    :param cmd: the ROS2 command to execute.
+    :param cmd: the ROS2 command as a list of arguments.
     :param delimiter: The delimiter to split the output by.
     :param pattern: A regular expression pattern to filter the list of entities.
     :return:
@@ -95,7 +124,7 @@ def ros2_node_list(pattern: Optional[str] = None, blacklist: Optional[List[str]]
 
     :param pattern: A regular expression pattern to filter the list of nodes.
     """
-    cmd = "ros2 node list"
+    cmd = ["ros2", "node", "list"]
     nodes = get_entities(cmd, pattern=pattern, blacklist=blacklist)
     return {"nodes": nodes}
 
@@ -107,7 +136,7 @@ def ros2_topic_list(pattern: Optional[str] = None, blacklist: Optional[List[str]
 
     :param pattern: A regular expression pattern to filter the list of topics.
     """
-    cmd = "ros2 topic list"
+    cmd = ["ros2", "topic", "list"]
     topics = get_entities(cmd, pattern=pattern, blacklist=blacklist)
     return {"topics": topics}
 
@@ -132,7 +161,8 @@ def ros2_topic_echo(
     :note: Do not set return_echoes to True if the number of messages is large.
            This will cause the response to be too large and may cause the tool to fail.
     """
-    cmd = f"ros2 topic echo {topic} --once --spin-time {timeout}"
+    _validate_ros_arg(topic, "topic name")
+    cmd = ["ros2", "topic", "echo", topic, "--once", "--spin-time", str(timeout)]
 
     if count < 1 or count > 10:
         return {"error": "Count must be between 1 and 10."}
@@ -165,7 +195,7 @@ def ros2_service_list(
 
     :param pattern: A regular expression pattern to filter the list of services.
     """
-    cmd = "ros2 service list"
+    cmd = ["ros2", "service", "list"]
     services = get_entities(cmd, pattern=pattern, blacklist=blacklist)
     return {"services": services}
 
@@ -180,8 +210,8 @@ def ros2_node_info(nodes: List[str]) -> dict:
     data = {}
 
     for node_name in nodes:
-
-        cmd = f"ros2 node info {node_name}"
+        _validate_ros_arg(node_name, "node name")
+        cmd = ["ros2", "node", "info", node_name]
         success, output = execute_ros_command(cmd)
         if not success:
             data[node_name] = dict(error=output)
@@ -201,7 +231,8 @@ def ros2_topic_info(topics: List[str]) -> dict:
     data = {}
 
     for topic in topics:
-        cmd = f"ros2 topic info {topic} --verbose"
+        _validate_ros_arg(topic, "topic name")
+        cmd = ["ros2", "topic", "info", topic, "--verbose"]
         success, output = execute_ros_command(cmd)
         if not success:
             topic_info = dict(error=output)
@@ -226,7 +257,8 @@ def ros2_param_list(
     :param pattern: A regular expression pattern to filter the list of parameters.
     """
     if node_name:
-        cmd = f"ros2 param list {node_name}"
+        _validate_ros_arg(node_name, "node name")
+        cmd = ["ros2", "param", "list", node_name]
         success, output = execute_ros_command(cmd)
         if not success:
             return {"error": output}
@@ -240,7 +272,7 @@ def ros2_param_list(
             ]
         return {node_name: params}
     else:
-        cmd = f"ros2 param list"
+        cmd = ["ros2", "param", "list"]
         success, output = execute_ros_command(cmd)
 
         if not success:
@@ -277,7 +309,9 @@ def ros2_param_get(node_name: str, param_name: str) -> dict:
     :param node_name: The name of the ROS2 node.
     :param param_name: The name of the parameter.
     """
-    cmd = f"ros2 param get {node_name} {param_name}"
+    _validate_ros_arg(node_name, "node name")
+    _validate_ros_arg(param_name, "parameter name")
+    cmd = ["ros2", "param", "get", node_name, param_name]
     success, output = execute_ros_command(cmd)
 
     if not success:
@@ -295,7 +329,10 @@ def ros2_param_set(node_name: str, param_name: str, param_value: str) -> dict:
     :param param_name: The name of the parameter.
     :param param_value: The value to set the parameter to.
     """
-    cmd = f"ros2 param set {node_name} {param_name} {param_value}"
+    _validate_ros_arg(node_name, "node name")
+    _validate_ros_arg(param_name, "parameter name")
+    _validate_ros_arg(str(param_value), "parameter value")
+    cmd = ["ros2", "param", "set", node_name, param_name, str(param_value)]
     success, output = execute_ros_command(cmd)
 
     if not success:
@@ -314,7 +351,8 @@ def ros2_service_info(services: List[str]) -> dict:
     data = {}
 
     for service_name in services:
-        cmd = f"ros2 service type {service_name}"
+        _validate_ros_arg(service_name, "service name")
+        cmd = ["ros2", "service", "type", service_name]
         success, output = execute_ros_command(cmd)
 
         if not success:
@@ -335,7 +373,11 @@ def ros2_service_call(service_name: str, srv_type: str, request: str) -> dict:
     :param srv_type: The type of the service (use ros2_service_info to verify).
     :param request: The request to send to the service.
     """
-    cmd = f'ros2 service call {service_name} {srv_type} "{request}"'
+    _validate_ros_arg(service_name, "service name")
+    _validate_ros_arg(srv_type, "service type")
+    # Note: request is passed as a single argument element, so the shell
+    # never interprets its contents.  No additional escaping is needed.
+    cmd = ["ros2", "service", "call", service_name, srv_type, request]
     success, output = execute_ros_command(cmd)
     if not success:
         return {"error": output}
@@ -347,7 +389,7 @@ def ros2_doctor() -> dict:
     """
     Check ROS setup and other potential issues.
     """
-    cmd = "ros2 doctor"
+    cmd = ["ros2", "doctor"]
     success, output = execute_ros_command(cmd)
     if not success:
         return {"error": output}
